@@ -6,7 +6,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -35,6 +35,10 @@ pub enum LedCommand {
     QuickFlashMr { count: u8 },
     /// Turn off all G-key LEDs
     TurnOffGKeys,
+    /// Set entire keyboard to a single color
+    SetFullKeyboardColor { r: u8, g: u8, b: u8 },
+    /// Restore G-keys to configured color (or turn off if None)
+    RestoreGKeysColor { color: Option<(u8, u8, u8)> },
     /// Shutdown the LED controller thread
     Shutdown,
 }
@@ -45,27 +49,30 @@ const MR_FLASH_INTERVAL: Duration = Duration::from_millis(500);
 /// MR LED quick flash interval for success (125ms on, 125ms off)
 const MR_QUICK_FLASH_INTERVAL: Duration = Duration::from_millis(125);
 
+/// Time window (ms) to ignore MR events after LED write
+const MR_LED_DEBOUNCE_MS: u64 = 30;
+
 /// LED controller that runs operations in a dedicated thread
 pub struct LedController {
     tx: Sender<LedCommand>,
     thread: Option<JoinHandle<()>>,
-    /// Flag set by LED thread before writing MR LED commands
-    /// Main thread can check this to distinguish LED-generated MR events from user presses
-    mr_led_write_pending: Arc<AtomicBool>,
+    /// Timestamp of last MR LED write (ms since UNIX epoch)
+    /// Cleared after consuming one phantom event
+    mr_led_write_time: Arc<AtomicU64>,
 }
 
 impl LedController {
     /// Create a new LED controller with its own thread
     pub fn new(device_path: PathBuf) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
-        let mr_led_write_pending = Arc::new(AtomicBool::new(false));
-        let mr_flag_clone = mr_led_write_pending.clone();
+        let mr_led_write_time = Arc::new(AtomicU64::new(0));
+        let mr_time_clone = mr_led_write_time.clone();
 
         let path_clone = device_path.clone();
         let thread = thread::Builder::new()
             .name("led-controller".into())
             .spawn(move || {
-                if let Err(e) = led_worker(path_clone, rx, mr_flag_clone) {
+                if let Err(e) = led_worker(path_clone, rx, mr_time_clone) {
                     log::error!("LED worker error: {}", e);
                 }
             })
@@ -76,14 +83,25 @@ impl LedController {
         Ok(Self {
             tx,
             thread: Some(thread),
-            mr_led_write_pending,
+            mr_led_write_time,
         })
     }
 
-    /// Check if an MR LED write is pending (i.e., MR event is from LED, not user)
-    /// Clears the flag after checking
+    /// Check if MR event is from LED write (within debounce window)
+    /// Consumes at most one event per LED write by clearing the timestamp
     pub fn is_mr_event_from_led(&self) -> bool {
-        self.mr_led_write_pending.swap(false, Ordering::SeqCst)
+        let write_time = self.mr_led_write_time.load(Ordering::SeqCst);
+        if write_time == 0 {
+            return false; // No pending LED write or already consumed
+        }
+        let now = current_time_ms();
+        if now.saturating_sub(write_time) < MR_LED_DEBOUNCE_MS {
+            // Within window - consume by clearing timestamp
+            self.mr_led_write_time.store(0, Ordering::SeqCst);
+            true
+        } else {
+            false // Outside window, real press
+        }
     }
 
     /// Send a command to the LED controller
@@ -133,6 +151,16 @@ impl LedController {
         self.send(LedCommand::TurnOffGKeys);
     }
 
+    /// Set entire keyboard to a single color
+    pub fn set_full_keyboard_color(&self, r: u8, g: u8, b: u8) {
+        self.send(LedCommand::SetFullKeyboardColor { r, g, b });
+    }
+
+    /// Restore G-keys to configured color (or turn off if None)
+    pub fn restore_gkeys_color(&self, color: Option<(u8, u8, u8)>) {
+        self.send(LedCommand::RestoreGKeysColor { color });
+    }
+
     /// Shutdown the LED controller
     pub fn shutdown(&self) {
         self.send(LedCommand::Shutdown);
@@ -148,11 +176,19 @@ impl Drop for LedController {
     }
 }
 
+/// Get current time in milliseconds since UNIX epoch
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// LED worker thread function
 fn led_worker(
     device_path: PathBuf,
     rx: Receiver<LedCommand>,
-    mr_led_write_pending: Arc<AtomicBool>,
+    mr_led_write_time: Arc<AtomicU64>,
 ) -> Result<()> {
     // Open device for writing (separate handle from the reader)
     let mut file = OpenOptions::new()
@@ -180,7 +216,7 @@ fn led_worker(
                 match cmd {
                     LedCommand::SetMrLed(on) => {
                         // Set flag before writing MR LED command
-                        mr_led_write_pending.store(true, Ordering::SeqCst);
+                        mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                         write_report(&mut file, &events::mr_led_command(on));
                     }
 
@@ -210,14 +246,14 @@ fn led_worker(
                         flash_on = true;
                         last_flash = Instant::now();
                         // Set flag before writing MR LED command
-                        mr_led_write_pending.store(true, Ordering::SeqCst);
+                        mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                         write_report(&mut file, &events::mr_led_command(true));
                     }
 
                     LedCommand::StopMrFlashing => {
                         flashing = false;
                         // Set flag before writing MR LED command
-                        mr_led_write_pending.store(true, Ordering::SeqCst);
+                        mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                         write_report(&mut file, &events::mr_led_command(false));
                     }
 
@@ -225,10 +261,10 @@ fn led_worker(
                         flashing = false;
                         for _ in 0..count {
                             // Set flag before each MR LED command
-                            mr_led_write_pending.store(true, Ordering::SeqCst);
+                            mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                             write_report(&mut file, &events::mr_led_command(true));
                             thread::sleep(MR_QUICK_FLASH_INTERVAL);
-                            mr_led_write_pending.store(true, Ordering::SeqCst);
+                            mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                             write_report(&mut file, &events::mr_led_command(false));
                             thread::sleep(MR_QUICK_FLASH_INTERVAL);
                         }
@@ -239,10 +275,34 @@ fn led_worker(
                         write_report(&mut file, &events::led_commit_command());
                     }
 
+                    LedCommand::SetFullKeyboardColor { r, g, b } => {
+                        // Send initialization sequence first (required for direct mode)
+                        for cmd in events::direct_mode_init_commands() {
+                            write_report(&mut file, &cmd);
+                        }
+                        // Set all keys to the specified color
+                        for cmd in events::full_keyboard_color_commands(r, g, b) {
+                            write_report(&mut file, &cmd);
+                        }
+                        write_report(&mut file, &events::led_commit_command());
+                    }
+
+                    LedCommand::RestoreGKeysColor { color } => {
+                        match color {
+                            Some((r, g, b)) => {
+                                write_report(&mut file, &events::all_gkeys_led_command(r, g, b));
+                            }
+                            None => {
+                                write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));
+                            }
+                        }
+                        write_report(&mut file, &events::led_commit_command());
+                    }
+
                     LedCommand::Shutdown => {
                         // Turn off LEDs before exiting
                         flashing = false;
-                        mr_led_write_pending.store(true, Ordering::SeqCst);
+                        mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                         write_report(&mut file, &events::mr_led_command(false));
                         write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));
                         write_report(&mut file, &events::led_commit_command());
@@ -258,7 +318,7 @@ fn led_worker(
                     flash_on = !flash_on;
                     last_flash = Instant::now();
                     // Set flag before writing MR LED command
-                    mr_led_write_pending.store(true, Ordering::SeqCst);
+                    mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                     write_report(&mut file, &events::mr_led_command(flash_on));
                 }
             }

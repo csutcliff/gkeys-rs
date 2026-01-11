@@ -102,6 +102,12 @@ fn main() -> Result<()> {
             .unwrap_or(1);
         led.set_profile_led(profile_num);
 
+        // Apply configured RGB color to entire keyboard if set
+        if let Some(ref color) = config.rgb_color {
+            log::info!("Setting keyboard color to RGB({}, {}, {})", color.r, color.g, color.b);
+            led.set_full_keyboard_color(color.r, color.g, color.b);
+        }
+
         log::info!("Ready. Listening for G-key events...");
 
         // Inner event loop - runs until device disconnects or shutdown
@@ -279,8 +285,9 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
         } => {
             // Quick flash MR LED (handled by LED thread)
             led.quick_flash_mr(MR_QUICK_FLASH_COUNT);
-            // Turn off G-key LEDs
-            led.turn_off_gkeys();
+            // Restore G-key LEDs to configured color (or off if not set)
+            let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
+            led.restore_gkeys_color(gkey_color);
 
             // Save the macro
             let macro_name = format!("MACRO_{}", gkey);
@@ -313,9 +320,10 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
         }
 
         RecordingAction::CancelledEmpty => {
-            // No keys captured - just turn off LEDs, no flash
+            // No keys captured - just restore LEDs, no flash
             led.stop_mr_flashing();
-            led.turn_off_gkeys();
+            let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
+            led.restore_gkeys_color(gkey_color);
             log::info!("Recording cancelled - no keys captured");
             let _ = std::process::Command::new("notify-send")
                 .args(["-a", "gkeys-rs", "Recording cancelled", "No keys were captured"])
@@ -323,16 +331,18 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
         }
 
         RecordingAction::CancelledNoGKey => {
-            // MR pressed without G-key - just turn off LEDs, no flash
+            // MR pressed without G-key - just restore LEDs, no flash
             led.set_mr_led(false);
-            led.turn_off_gkeys();
+            let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
+            led.restore_gkeys_color(gkey_color);
             log::debug!("Recording cancelled - no G-key selected");
         }
 
         RecordingAction::Error(msg) => {
-            // Error - turn off LEDs
+            // Error - restore LEDs
             led.stop_mr_flashing();
-            led.turn_off_gkeys();
+            let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
+            led.restore_gkeys_color(gkey_color);
             log::error!("Recording error: {}", msg);
             let _ = std::process::Command::new("notify-send")
                 .args(["-a", "gkeys-rs", "Recording error", &msg])

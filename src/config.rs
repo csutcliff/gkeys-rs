@@ -14,6 +14,8 @@ pub struct Config {
     pub keyboard_mapping: String,
     #[serde(default = "default_notify")]
     pub notify: StringBool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rgb_color: Option<RgbColor>,
     pub profiles: HashMap<String, Profile>,
 }
 
@@ -58,6 +60,14 @@ impl Serialize for StringBool {
         // Serialize as boolean for clean JSON output
         serializer.serialize_bool(self.0)
     }
+}
+
+/// RGB color for keyboard LED configuration
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RgbColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
