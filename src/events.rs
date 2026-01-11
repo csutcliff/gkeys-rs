@@ -18,6 +18,7 @@ pub enum Event {
 }
 
 /// Keyboard definition with HID patterns
+#[allow(dead_code)]
 pub struct KeyboardDef {
     pub name: &'static str,
     pub vendor_id: u16,

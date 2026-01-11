@@ -103,6 +103,7 @@ pub mod keys {
     pub const KEY_COMMA: u16 = 51;
     pub const KEY_DOT: u16 = 52;
     pub const KEY_SLASH: u16 = 53;
+    #[allow(dead_code)]
     pub const KEY_RIGHTSHIFT: u16 = 54;
     pub const KEY_LEFTALT: u16 = 56;
     pub const KEY_SPACE: u16 = 57;
@@ -127,7 +128,9 @@ pub mod keys {
     pub const KEY_F18: u16 = 188;
     pub const KEY_F19: u16 = 189;
     pub const KEY_F20: u16 = 190;
+    #[allow(dead_code)]
     pub const KEY_RIGHTCTRL: u16 = 97;
+    #[allow(dead_code)]
     pub const KEY_RIGHTALT: u16 = 100;
     pub const KEY_HOME: u16 = 102;
     pub const KEY_UP: u16 = 103;
@@ -140,6 +143,7 @@ pub mod keys {
     pub const KEY_INSERT: u16 = 110;
     pub const KEY_DELETE: u16 = 111;
     pub const KEY_LEFTMETA: u16 = 125;
+    #[allow(dead_code)]
     pub const KEY_RIGHTMETA: u16 = 126;
     pub const KEY_MAX: u16 = 0x2ff;
 }

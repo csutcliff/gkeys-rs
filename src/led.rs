@@ -33,8 +33,6 @@ pub enum LedCommand {
     StopMrFlashing,
     /// Quick flash MR LED (for successful save)
     QuickFlashMr { count: u8 },
-    /// Turn off all G-key LEDs
-    TurnOffGKeys,
     /// Set entire keyboard to a single color
     SetFullKeyboardColor { r: u8, g: u8, b: u8 },
     /// Restore G-keys to configured color (or turn off if None)
@@ -146,11 +144,6 @@ impl LedController {
         self.send(LedCommand::QuickFlashMr { count });
     }
 
-    /// Turn off all G-key LEDs
-    pub fn turn_off_gkeys(&self) {
-        self.send(LedCommand::TurnOffGKeys);
-    }
-
     /// Set entire keyboard to a single color
     pub fn set_full_keyboard_color(&self, r: u8, g: u8, b: u8) {
         self.send(LedCommand::SetFullKeyboardColor { r, g, b });
@@ -161,10 +154,6 @@ impl LedController {
         self.send(LedCommand::RestoreGKeysColor { color });
     }
 
-    /// Shutdown the LED controller
-    pub fn shutdown(&self) {
-        self.send(LedCommand::Shutdown);
-    }
 }
 
 impl Drop for LedController {
@@ -270,11 +259,6 @@ fn led_worker(
                         }
                     }
 
-                    LedCommand::TurnOffGKeys => {
-                        write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));
-                        write_report(&mut file, &events::led_commit_command());
-                    }
-
                     LedCommand::SetFullKeyboardColor { r, g, b } => {
                         // Send initialization sequence first (required for direct mode)
                         for cmd in events::direct_mode_init_commands() {
@@ -301,7 +285,6 @@ fn led_worker(
 
                     LedCommand::Shutdown => {
                         // Turn off LEDs before exiting
-                        flashing = false;
                         mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
                         write_report(&mut file, &events::mr_led_command(false));
                         write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));

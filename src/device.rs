@@ -1,14 +1,14 @@
 //! hidraw device discovery and I/O
 
 use std::fs::{read_dir, read_to_string, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::events::{self, Event, G815};
+use crate::events::{parse_report, Event, G815};
 
 pub struct Device {
     file: File,
@@ -44,7 +44,7 @@ impl Device {
     pub fn read_event_blocking(&mut self) -> Result<Option<Event>> {
         let mut buf = [0u8; 20];
         match self.file.read(&mut buf) {
-            Ok(n) if n > 0 => Ok(events::parse_report(&buf[..n])),
+            Ok(n) if n > 0 => Ok(parse_report(&buf[..n])),
             Ok(_) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -75,69 +75,12 @@ impl Device {
         // Data available, read it
         let mut buf = [0u8; 20];
         match self.file.read(&mut buf) {
-            Ok(n) if n > 0 => Ok(events::parse_report(&buf[..n])),
+            Ok(n) if n > 0 => Ok(parse_report(&buf[..n])),
             Ok(_) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Send a HID report to the device (direct write, like g810-led)
-    pub fn send_report(&mut self, data: &[u8; 20]) -> Result<()> {
-        self.file
-            .write_all(data)
-            .context("Failed to write HID report")?;
-        Ok(())
-    }
-
-    /// Set the profile LED (M1, M2, or M3)
-    pub fn set_profile_led(&mut self, profile: u8) -> Result<()> {
-        let cmd = events::led_command(profile);
-        self.send_report(&cmd)
-    }
-
-    /// Set the MR (Memory Record) LED on or off
-    pub fn set_mr_led(&mut self, on: bool) -> Result<()> {
-        let cmd = events::mr_led_command(on);
-        self.send_report(&cmd)
-    }
-
-    /// Set a single G-key LED color (1-5) without committing
-    /// Call commit_leds() after setting all desired keys
-    pub fn set_gkey_led_no_commit(&mut self, gkey: u8, r: u8, g: u8, b: u8) -> Result<()> {
-        let cmd = events::gkey_led_command(gkey, r, g, b);
-        self.send_report(&cmd)
-    }
-
-    /// Set all G-keys (1-5) to the same color
-    pub fn set_all_gkeys_led(&mut self, r: u8, g: u8, b: u8) -> Result<()> {
-        let cmd = events::all_gkeys_led_command(r, g, b);
-        self.send_report(&cmd)?;
-        self.commit_leds()
-    }
-
-    /// Set G-keys for recording: selected key red, others off
-    pub fn set_gkeys_recording(&mut self, selected_gkey: u8) -> Result<()> {
-        for g in 1..=5u8 {
-            let (r, gv, b) = if g == selected_gkey {
-                (255, 0, 0) // Red
-            } else {
-                (0, 0, 0) // Off
-            };
-            self.set_gkey_led_no_commit(g, r, gv, b)?;
-        }
-        self.commit_leds()
-    }
-
-    /// Turn off all G-key LEDs
-    pub fn turn_off_gkeys(&mut self) -> Result<()> {
-        self.set_all_gkeys_led(0, 0, 0)
-    }
-
-    /// Commit LED changes (required after setting colors)
-    pub fn commit_leds(&mut self) -> Result<()> {
-        let cmd = events::led_commit_command();
-        self.send_report(&cmd)
-    }
 }
 
 /// Find the hidraw device for the G815 keyboard interface 1

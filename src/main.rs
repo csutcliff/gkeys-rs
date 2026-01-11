@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let mut current_profile = String::from("MEMORY_1");
 
     // LED controller (created per device connection)
-    let mut led_controller: Option<LedController> = None;
+    let mut led_controller: Option<LedController>;
 
     // Setup signal handling for clean shutdown
     let running = Arc::new(AtomicBool::new(true));
