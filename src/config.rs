@@ -2,14 +2,15 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub keyboard_mapping: String,
     #[serde(default = "default_notify")]
     pub notify: StringBool,
@@ -49,20 +50,30 @@ impl<'de> Deserialize<'de> for StringBool {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl Serialize for StringBool {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as boolean for clean JSON output
+        serializer.serialize_bool(self.0)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Profile {
     #[serde(flatten)]
     pub macros: HashMap<String, Macro>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Macro {
     pub hotkey_type: HotkeyType,
-    #[serde(rename = "do", default)]
+    #[serde(rename = "do", default, skip_serializing_if = "String::is_empty")]
     pub action: String,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HotkeyType {
     Run,
@@ -100,6 +111,41 @@ impl Config {
     /// Get a macro definition for the given profile and key
     pub fn get_macro(&self, profile: &str, macro_name: &str) -> Option<&Macro> {
         self.profiles.get(profile)?.macros.get(macro_name)
+    }
+
+    /// Set a macro definition for the given profile and key
+    pub fn set_macro(&mut self, profile: &str, macro_name: &str, macro_def: Macro) {
+        let profile_entry = self
+            .profiles
+            .entry(profile.to_string())
+            .or_insert_with(|| Profile {
+                macros: HashMap::new(),
+            });
+        profile_entry.macros.insert(macro_name.to_string(), macro_def);
+    }
+
+    /// Save config to file, creating a backup first
+    pub fn save(&self) -> Result<()> {
+        let path = Self::config_path()?;
+        let backup_path = path.with_extension("json.bak");
+
+        // Create backup if file exists
+        if path.exists() {
+            fs::copy(&path, &backup_path)
+                .with_context(|| format!("Failed to create backup at {}", backup_path.display()))?;
+            log::info!("Created config backup at {}", backup_path.display());
+        }
+
+        // Write new config with pretty formatting
+        let json = serde_json::to_string_pretty(self)
+            .context("Failed to serialize config")?;
+        let mut file = fs::File::create(&path)
+            .with_context(|| format!("Failed to create config at {}", path.display()))?;
+        file.write_all(json.as_bytes())
+            .with_context(|| format!("Failed to write config to {}", path.display()))?;
+
+        log::info!("Saved config to {}", path.display());
+        Ok(())
     }
 }
 

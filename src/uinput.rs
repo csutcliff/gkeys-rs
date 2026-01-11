@@ -156,13 +156,33 @@ static KEY_MAP: LazyLock<HashMap<&'static str, u16>> = LazyLock::new(|| {
     m.insert("meta", keys::KEY_LEFTMETA);
     m.insert("win", keys::KEY_LEFTMETA);
 
-    // Letters
-    for (i, c) in ('a'..='z').enumerate() {
-        m.insert(
-            Box::leak(c.to_string().into_boxed_str()),
-            keys::KEY_A + i as u16,
-        );
-    }
+    // Letters - must use QWERTY layout key codes, not alphabetical
+    m.insert("a", keys::KEY_A);
+    m.insert("b", keys::KEY_B);
+    m.insert("c", keys::KEY_C);
+    m.insert("d", keys::KEY_D);
+    m.insert("e", keys::KEY_E);
+    m.insert("f", keys::KEY_F);
+    m.insert("g", keys::KEY_G);
+    m.insert("h", keys::KEY_H);
+    m.insert("i", keys::KEY_I);
+    m.insert("j", keys::KEY_J);
+    m.insert("k", keys::KEY_K);
+    m.insert("l", keys::KEY_L);
+    m.insert("m", keys::KEY_M);
+    m.insert("n", keys::KEY_N);
+    m.insert("o", keys::KEY_O);
+    m.insert("p", keys::KEY_P);
+    m.insert("q", keys::KEY_Q);
+    m.insert("r", keys::KEY_R);
+    m.insert("s", keys::KEY_S);
+    m.insert("t", keys::KEY_T);
+    m.insert("u", keys::KEY_U);
+    m.insert("v", keys::KEY_V);
+    m.insert("w", keys::KEY_W);
+    m.insert("x", keys::KEY_X);
+    m.insert("y", keys::KEY_Y);
+    m.insert("z", keys::KEY_Z);
 
     // Numbers
     m.insert("0", keys::KEY_0);

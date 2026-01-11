@@ -105,6 +105,72 @@ pub fn led_command(profile: u8) -> [u8; 20] {
     cmd
 }
 
+/// MR (Memory Record) key LED control command
+/// Returns a 20-byte HID report
+/// Command: [0x11, 0xff, 0x0c, 0x0c, value]
+/// where value is 0x00=off, 0x01=on
+pub fn mr_led_command(on: bool) -> [u8; 20] {
+    let mut cmd = [0u8; 20];
+    cmd[0] = 0x11;
+    cmd[1] = 0xff;
+    cmd[2] = 0x0c;
+    cmd[3] = 0x0c;
+    cmd[4] = if on { 0x01 } else { 0x00 };
+    cmd
+}
+
+/// G-key LED color command
+/// Sets the RGB color for a single G-key (1-5)
+/// Command: [0x11, 0xff, 0x10, 0x6c, r, g, b, key_addr, 0xff, ...]
+/// G-key addresses: G1=0xb4, G2=0xb5, G3=0xb6, G4=0xb7, G5=0xb8
+pub fn gkey_led_command(gkey: u8, r: u8, g: u8, b: u8) -> [u8; 20] {
+    let mut cmd = [0u8; 20];
+    cmd[0] = 0x11;
+    cmd[1] = 0xff;
+    cmd[2] = 0x10;
+    cmd[3] = 0x6c;
+    cmd[4] = r;
+    cmd[5] = g;
+    cmd[6] = b;
+    // G-key address = gkey + 0xb3 (so G1=0xb4, G2=0xb5, etc.)
+    cmd[7] = gkey.saturating_add(0xb3);
+    cmd[8] = 0xff; // Terminator
+    cmd
+}
+
+/// Set all G-keys (1-5) to the same color in a single command
+/// Command: [0x11, 0xff, 0x10, 0x6c, r, g, b, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xff, ...]
+pub fn all_gkeys_led_command(r: u8, g: u8, b: u8) -> [u8; 20] {
+    let mut cmd = [0u8; 20];
+    cmd[0] = 0x11;
+    cmd[1] = 0xff;
+    cmd[2] = 0x10;
+    cmd[3] = 0x6c;
+    cmd[4] = r;
+    cmd[5] = g;
+    cmd[6] = b;
+    // All 5 G-key addresses
+    cmd[7] = 0xb4;  // G1
+    cmd[8] = 0xb5;  // G2
+    cmd[9] = 0xb6;  // G3
+    cmd[10] = 0xb7; // G4
+    cmd[11] = 0xb8; // G5
+    cmd[12] = 0xff; // Terminator
+    cmd
+}
+
+/// Commit LED changes
+/// Must be sent after setting key colors for changes to take effect
+/// Command: [0x11, 0xff, 0x10, 0x7f, ...]
+pub fn led_commit_command() -> [u8; 20] {
+    let mut cmd = [0u8; 20];
+    cmd[0] = 0x11;
+    cmd[1] = 0xff;
+    cmd[2] = 0x10;
+    cmd[3] = 0x7f;
+    cmd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
