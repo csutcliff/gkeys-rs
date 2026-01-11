@@ -7,8 +7,10 @@ A Rust daemon for handling Logitech keyboard G-key macros on Linux via hidraw.
 - **Coexists with OpenRGB**: Uses hidraw instead of libusb, so the kernel HID driver remains attached and OpenRGB can control keyboard lighting
 - **Automatic reconnection**: Survives keyboard disconnection (KVM switches, monitor standby, USB reconnects) with exponential backoff retry
 - **Profile switching**: M1/M2/M3 keys switch between profiles with LED feedback
+- **Macro recording**: Record macros directly on the keyboard using the MR key
+- **RGB color control**: Optional static color for the entire keyboard on daemon startup
 - **Multiple macro types**: run, shortcut, typeout, uinput, sequence
-- **Desktop notifications**: Optional notifications on profile switch
+- **Desktop notifications**: Optional notifications on profile switch and macro recording
 - **Low resource usage**: Small Rust binary with minimal dependencies
 
 ## Compatibility
@@ -79,6 +81,23 @@ Create a configuration file at `~/.config/gkeys-rs/config.json`:
 }
 ```
 
+### RGB Color (Optional)
+
+Set a static color for the entire keyboard on daemon startup:
+
+```json
+{
+  "notify": true,
+  "rgb_color": { "r": 255, "g": 165, "b": 0 },
+  "profiles": { ... }
+}
+```
+
+- When set, applies the color to all 117 keyboard LEDs on startup
+- G-keys are restored to this color after macro recording completes
+- **Omit this field** to let external tools (like OpenRGB) manage keyboard lighting
+- Values are 0-255 for each channel
+
 ### Macro Types
 
 | Type | Description | Example |
@@ -124,6 +143,34 @@ systemctl --user enable --now gkeys-rs.service
 RUST_LOG=debug gkeys-rs
 ```
 
+## Macro Recording
+
+Record key sequences directly on the keyboard without editing the config file.
+
+### How to Record
+
+1. **Press MR** - MR LED turns on, all G-keys light up white
+2. **Press a G-key** (G1-G5) - Selected G-key turns red, MR LED starts flashing, recording begins
+3. **Type your key sequence** - All keystrokes are captured
+4. **Press MR again** - Recording stops, macro is saved to config
+
+### LED Feedback
+
+| State | MR LED | G-Key LEDs |
+|-------|--------|------------|
+| Idle | Off | Normal/configured color |
+| Awaiting G-key selection | On (solid) | All white |
+| Recording | Flashing | Selected key red, others off |
+| Save successful | Quick flash (4x) | Return to normal |
+
+### Notes
+
+- Recorded macros are saved as `sequence` type (e.g., `"do": "h, e, l, l, o"`)
+- Macros are saved to the current profile (M1/M2/M3)
+- A backup of the config is created before saving (`config.json.bak`)
+- Press MR twice quickly (without selecting a G-key) to cancel
+- Recording with no keys captured shows a cancellation notification
+
 ## Requirements
 
 - User must be in `input` group (for hidraw access) or use appropriate udev rules
@@ -159,7 +206,12 @@ This project was inspired by and references code from:
 
 - **[g810-led](https://github.com/MatMoul/g810-led)** by MatMoul
   - LED control protocol reverse engineering
-  - M-key LED command format (`0x11 0xff 0x0b 0x1c`)
+  - M-key LED command format
+  - Key address offset calculations
+
+- **[OpenRGB](https://gitlab.com/CalcProgrammer1/OpenRGB)** by CalcProgrammer1
+  - G815 per-key LED addresses
+  - Direct mode initialization sequence
 
 ## Why gkeys-rs?
 
