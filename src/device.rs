@@ -1,7 +1,7 @@
 //! hidraw device discovery and I/O
 
 use std::fs::{read_dir, read_to_string, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,7 +26,69 @@ impl Device {
             .open(&path)
             .with_context(|| format!("Failed to open {}", path.display()))?;
         log::info!("Opened device: {}", path.display());
-        Ok(Self { file, path })
+
+        let mut dev = Self { file, path };
+        dev.initialize_gkeys()?;
+        Ok(dev)
+    }
+
+    /// Initialize G-key software mode via HID++ 2.0
+    /// This disables onboard profiles so G-keys only send vendor reports
+    fn initialize_gkeys(&mut self) -> Result<()> {
+        let mut cmd = [0u8; 20];
+        let mut resp = [0u8; 20];
+        cmd[0] = 0x11;
+        cmd[1] = 0xff;
+
+        // Query ONBOARD_PROFILES feature index (0x8100)
+        cmd[2] = 0x00; // Root feature
+        cmd[3] = 0x00; // getFeatureIndex function
+        cmd[4] = 0x81; // Feature ID high byte
+        cmd[5] = 0x00; // Feature ID low byte
+        self.file.write_all(&cmd)?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = self.file.read(&mut resp);
+        let onboard_idx = resp[4];
+
+        if onboard_idx != 0 {
+            log::debug!("ONBOARD_PROFILES feature at index 0x{:02x}", onboard_idx);
+            // Set onboard mode to DISABLED (0x02) - disables onboard key bindings
+            cmd[2] = onboard_idx;
+            cmd[3] = 0x10; // setMode function
+            cmd[4] = 0x02; // Disabled mode (no onboard profile)
+            cmd[5] = 0x00;
+            self.file.write_all(&cmd)?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            log::info!("Onboard profiles disabled");
+        } else {
+            log::warn!("ONBOARD_PROFILES feature not found");
+        }
+
+        // Query GKEYS feature index (0x8010)
+        cmd[2] = 0x00;
+        cmd[3] = 0x00;
+        cmd[4] = 0x80;
+        cmd[5] = 0x10;
+        self.file.write_all(&cmd)?;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = self.file.read(&mut resp);
+        let gkeys_idx = resp[4];
+
+        if gkeys_idx != 0 {
+            log::debug!("GKEYS feature at index 0x{:02x}", gkeys_idx);
+            // Initialize GKEYS (getCount)
+            cmd[2] = gkeys_idx;
+            cmd[3] = 0x00;
+            cmd[4] = 0x00;
+            cmd[5] = 0x00;
+            self.file.write_all(&cmd)?;
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        } else {
+            log::warn!("GKEYS feature not found");
+        }
+
+        log::info!("G-key software mode initialized");
+        Ok(())
     }
 
     /// Get the device path
