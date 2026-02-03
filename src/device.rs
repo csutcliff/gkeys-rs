@@ -59,6 +59,7 @@ impl Device {
             cmd[5] = 0x00;
             self.file.write_all(&cmd)?;
             std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = self.file.read(&mut resp); // Consume setMode response
             log::info!("Onboard profiles disabled");
         } else {
             log::warn!("ONBOARD_PROFILES feature not found");
@@ -76,13 +77,17 @@ impl Device {
 
         if gkeys_idx != 0 {
             log::debug!("GKEYS feature at index 0x{:02x}", gkeys_idx);
-            // Initialize GKEYS (getCount)
+            // Enable G-key diversion (function 0x20, param 0x01)
+            // This makes G-key presses generate HID++ vendor reports
+            // instead of their default onboard behavior
             cmd[2] = gkeys_idx;
-            cmd[3] = 0x00;
-            cmd[4] = 0x00;
+            cmd[3] = 0x20; // enableDiversion function
+            cmd[4] = 0x01; // enable
             cmd[5] = 0x00;
             self.file.write_all(&cmd)?;
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = self.file.read(&mut resp); // Consume response
+            log::info!("G-key diversion enabled");
         } else {
             log::warn!("GKEYS feature not found");
         }
