@@ -101,6 +101,47 @@ impl Device {
         &self.path
     }
 
+    /// Drain any buffered HID reports from the device
+    ///
+    /// After initialization and LED setup, the keyboard may have queued
+    /// response/notification reports that would be misinterpreted as key
+    /// events. This reads and discards all pending reports.
+    pub fn drain_buffer(&mut self) {
+        let fd = self.file.as_raw_fd();
+        let mut buf = [0u8; 20];
+        let mut count = 0;
+
+        loop {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+
+            // poll with 0 timeout = non-blocking check
+            let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ret <= 0 {
+                break;
+            }
+
+            match self.file.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    count += 1;
+                    log::debug!(
+                        "Drained buffered report #{}: {:02x?}",
+                        count,
+                        &buf[..n]
+                    );
+                }
+                _ => break,
+            }
+        }
+
+        if count > 0 {
+            log::info!("Drained {} buffered report(s) after initialization", count);
+        }
+    }
+
     /// Read and parse a HID event with timeout
     /// Returns Ok(None) if timeout expires without data
     pub fn read_event(&mut self) -> Result<Option<Event>> {

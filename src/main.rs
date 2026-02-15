@@ -108,6 +108,12 @@ fn main() -> Result<()> {
             led.set_full_keyboard_color(color.r, color.g, color.b);
         }
 
+        // After initialization and LED setup, the keyboard generates phantom
+        // HID reports (responses to LED commands, state notifications after
+        // diversion enable) that get misinterpreted as key events.
+        thread::sleep(Duration::from_millis(100));
+        device.drain_buffer();
+
         log::info!("Ready. Listening for G-key events...");
 
         // Inner event loop - runs until device disconnects or shutdown
