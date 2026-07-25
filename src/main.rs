@@ -4,6 +4,7 @@ mod events;
 mod led;
 mod macros;
 mod recording;
+mod udev_watcher;
 mod uinput;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +20,7 @@ use events::Event;
 use led::LedController;
 use macros::MacroExecutor;
 use recording::{Recorder, RecordingAction};
+use udev_watcher::UdevWatcher;
 
 /// Number of quick flashes on successful recording
 const MR_QUICK_FLASH_COUNT: u8 = 4;
@@ -62,20 +64,39 @@ fn main() -> Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
+    // Start udev watcher: its wake fd becomes readable on G815 remove events
+    // so blocking reads break out immediately rather than waiting for the
+    // stale fd to error. If the watcher fails to start we degrade to the
+    // old behaviour (poll-on-error) rather than crashing.
+    let udev = match UdevWatcher::new() {
+        Ok(w) => Some(w),
+        Err(e) => {
+            log::warn!("udev watcher unavailable: {} - falling back to read-error reconnect", e);
+            None
+        }
+    };
+    let wake_fd = udev.as_ref().map(|w| w.wake_fd());
+
     // Outer loop handles device reconnection
     let mut reconnect_delay = Duration::from_secs(1);
     let max_reconnect_delay = Duration::from_secs(30);
 
     while running.load(Ordering::SeqCst) {
+        // Swallow any pending wake bytes so they don't immediately trip the
+        // fresh device. We only want wakes from here on out.
+        if let Some(ref w) = udev {
+            w.drain();
+        }
+
         // Try to open device
-        let mut device = match Device::open() {
+        let mut device = match Device::open(wake_fd) {
             Ok(d) => {
                 log::info!("Opened device: {}", d.path().display());
                 reconnect_delay = Duration::from_secs(1); // Reset delay on success
                 d
             }
             Err(e) => {
-                log::warn!("Device not found: {} - retrying in {:?}", e, reconnect_delay);
+                log::warn!("Device open/init failed: {} - retrying in {:?}", e, reconnect_delay);
                 thread::sleep(reconnect_delay);
                 reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
                 continue;

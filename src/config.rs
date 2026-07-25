@@ -24,14 +24,8 @@ fn default_notify() -> StringBool {
 }
 
 /// Handle Python-style "True"/"False" strings as bools
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StringBool(pub bool);
-
-impl Default for StringBool {
-    fn default() -> Self {
-        Self(false)
-    }
-}
 
 impl<'de> Deserialize<'de> for StringBool {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>

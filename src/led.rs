@@ -190,6 +190,10 @@ fn led_worker(
     let mut flashing = false;
     let mut flash_on = false;
     let mut last_flash = Instant::now();
+    // Set once a write errors out (USB removed). Skip subsequent writes
+    // including the Shutdown sequence so we don't spam ENODEV warnings
+    // every time a LedController is dropped after a disconnect.
+    let mut dead = false;
 
     loop {
         // Use timeout to handle flashing
@@ -206,16 +210,16 @@ fn led_worker(
                     LedCommand::SetMrLed(on) => {
                         // Set flag before writing MR LED command
                         mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                        write_report(&mut file, &events::mr_led_command(on));
+                        write_report(&mut file, &events::mr_led_command(on), &mut dead);
                     }
 
                     LedCommand::SetProfileLed(profile) => {
-                        write_report(&mut file, &events::led_command(profile));
+                        write_report(&mut file, &events::led_command(profile), &mut dead);
                     }
 
                     LedCommand::SetAllGKeysLed { r, g, b } => {
-                        write_report(&mut file, &events::all_gkeys_led_command(r, g, b));
-                        write_report(&mut file, &events::led_commit_command());
+                        write_report(&mut file, &events::all_gkeys_led_command(r, g, b), &mut dead);
+                        write_report(&mut file, &events::led_commit_command(), &mut dead);
                     }
 
                     LedCommand::SetGKeysRecording { selected_gkey } => {
@@ -225,9 +229,9 @@ fn led_worker(
                             } else {
                                 (0, 0, 0) // Off for others
                             };
-                            write_report(&mut file, &events::gkey_led_command(g, r, gv, b));
+                            write_report(&mut file, &events::gkey_led_command(g, r, gv, b), &mut dead);
                         }
-                        write_report(&mut file, &events::led_commit_command());
+                        write_report(&mut file, &events::led_commit_command(), &mut dead);
                     }
 
                     LedCommand::StartMrFlashing => {
@@ -236,14 +240,14 @@ fn led_worker(
                         last_flash = Instant::now();
                         // Set flag before writing MR LED command
                         mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                        write_report(&mut file, &events::mr_led_command(true));
+                        write_report(&mut file, &events::mr_led_command(true), &mut dead);
                     }
 
                     LedCommand::StopMrFlashing => {
                         flashing = false;
                         // Set flag before writing MR LED command
                         mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                        write_report(&mut file, &events::mr_led_command(false));
+                        write_report(&mut file, &events::mr_led_command(false), &mut dead);
                     }
 
                     LedCommand::QuickFlashMr { count } => {
@@ -251,10 +255,10 @@ fn led_worker(
                         for _ in 0..count {
                             // Set flag before each MR LED command
                             mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                            write_report(&mut file, &events::mr_led_command(true));
+                            write_report(&mut file, &events::mr_led_command(true), &mut dead);
                             thread::sleep(MR_QUICK_FLASH_INTERVAL);
                             mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                            write_report(&mut file, &events::mr_led_command(false));
+                            write_report(&mut file, &events::mr_led_command(false), &mut dead);
                             thread::sleep(MR_QUICK_FLASH_INTERVAL);
                         }
                     }
@@ -262,33 +266,35 @@ fn led_worker(
                     LedCommand::SetFullKeyboardColor { r, g, b } => {
                         // Send initialization sequence first (required for direct mode)
                         for cmd in events::direct_mode_init_commands() {
-                            write_report(&mut file, &cmd);
+                            write_report(&mut file, &cmd, &mut dead);
                         }
                         // Set all keys to the specified color
                         for cmd in events::full_keyboard_color_commands(r, g, b) {
-                            write_report(&mut file, &cmd);
+                            write_report(&mut file, &cmd, &mut dead);
                         }
-                        write_report(&mut file, &events::led_commit_command());
+                        write_report(&mut file, &events::led_commit_command(), &mut dead);
                     }
 
                     LedCommand::RestoreGKeysColor { color } => {
                         match color {
                             Some((r, g, b)) => {
-                                write_report(&mut file, &events::all_gkeys_led_command(r, g, b));
+                                write_report(&mut file, &events::all_gkeys_led_command(r, g, b), &mut dead);
                             }
                             None => {
-                                write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));
+                                write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0), &mut dead);
                             }
                         }
-                        write_report(&mut file, &events::led_commit_command());
+                        write_report(&mut file, &events::led_commit_command(), &mut dead);
                     }
 
                     LedCommand::Shutdown => {
-                        // Turn off LEDs before exiting
-                        mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                        write_report(&mut file, &events::mr_led_command(false));
-                        write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0));
-                        write_report(&mut file, &events::led_commit_command());
+                        if !dead {
+                            // Turn off LEDs before exiting
+                            mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
+                            write_report(&mut file, &events::mr_led_command(false), &mut dead);
+                            write_report(&mut file, &events::all_gkeys_led_command(0, 0, 0), &mut dead);
+                            write_report(&mut file, &events::led_commit_command(), &mut dead);
+                        }
                         log::debug!("LED worker shutting down");
                         break;
                     }
@@ -302,7 +308,7 @@ fn led_worker(
                     last_flash = Instant::now();
                     // Set flag before writing MR LED command
                     mr_led_write_time.store(current_time_ms(), Ordering::SeqCst);
-                    write_report(&mut file, &events::mr_led_command(flash_on));
+                    write_report(&mut file, &events::mr_led_command(flash_on), &mut dead);
                 }
             }
 
@@ -316,9 +322,16 @@ fn led_worker(
     Ok(())
 }
 
-/// Write a HID report to the device, logging errors
-fn write_report(file: &mut std::fs::File, data: &[u8; 20]) {
+/// Write a HID report to the device. Once a write fails (typically ENODEV
+/// after the USB node vanished) the `dead` flag latches and subsequent
+/// writes are skipped silently, so a dropped LedController or a burst of
+/// queued commands doesn't spam the log with repeated errors.
+fn write_report(file: &mut std::fs::File, data: &[u8; 20], dead: &mut bool) {
+    if *dead {
+        return;
+    }
     if let Err(e) = file.write_all(data) {
-        log::warn!("Failed to write LED report: {}", e);
+        log::warn!("LED write failed ({}); suppressing further writes on this handle", e);
+        *dead = true;
     }
 }
