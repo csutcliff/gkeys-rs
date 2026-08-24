@@ -25,13 +25,17 @@ pub struct Device {
     file: File,
     path: PathBuf,
     /// Optional external fd (e.g. udev watcher pipe) that breaks blocking
-    /// reads when it becomes readable.
+    /// reads when it becomes readable, signalling a disconnect.
     wake_fd: Option<std::os::fd::RawFd>,
+    /// Optional external fd (control-socket listener pipe) that breaks
+    /// blocking reads when a control request has been queued. Unlike
+    /// `wake_fd`, this does not signal a disconnect.
+    control_fd: Option<std::os::fd::RawFd>,
 }
 
 impl Device {
     /// Open the G815 keyboard hidraw device
-    pub fn open(wake_fd: Option<std::os::fd::RawFd>) -> Result<Self> {
+    pub fn open(wake_fd: Option<std::os::fd::RawFd>, control_fd: Option<std::os::fd::RawFd>) -> Result<Self> {
         let path = find_hidraw_device()?;
         // Open with read+write for both receiving events and sending commands
         let file = OpenOptions::new()
@@ -41,7 +45,7 @@ impl Device {
             .with_context(|| format!("Failed to open {}", path.display()))?;
         log::info!("Opened device: {}", path.display());
 
-        let mut dev = Self { file, path, wake_fd };
+        let mut dev = Self { file, path, wake_fd, control_fd };
 
         // Retry the full init sequence. On a KVM-mediated reconnect the
         // keyboard firmware is sometimes not yet responsive to HID++, and
@@ -177,7 +181,7 @@ impl Device {
                 bail!("HID++ response timeout for feature 0x{:02x} fn 0x{:02x}", feature_idx, function);
             }
             let mut resp = [0u8; 20];
-            if !poll_read(self.file.as_raw_fd(), None, &mut resp, remaining)? {
+            if !poll_read(self.file.as_raw_fd(), None, None, &mut resp, remaining)? {
                 continue;
             }
             // HID++ 2.0 error: header 0x11 0xff then feature_idx=0xff, the
@@ -254,10 +258,28 @@ impl Device {
         self.read_event_timeout(Duration::from_millis(100))
     }
 
+    /// Read and parse a HID event, blocking until one arrives, the wake fd
+    /// becomes readable, the control fd becomes readable, or an I/O error
+    /// occurs.
+    ///
+    /// - Wake fd fires -> returns a disconnect error so the caller
+    ///   reconnects.
+    /// - Control fd fires -> returns `Ok(None)`; there's no HID event to
+    ///   report, but a control request is now waiting on the channel for
+    ///   the caller to pick up. The caller should re-check that channel and
+    ///   then call this again.
+    pub fn read_event_blocking(&mut self) -> Result<Option<Event>> {
+        let mut buf = [0u8; 20];
+        if !poll_read(self.file.as_raw_fd(), self.wake_fd, self.control_fd, &mut buf, Duration::MAX)? {
+            return Ok(None);
+        }
+        Ok(parse_report(&buf))
+    }
+
     /// Read and parse a HID event with specified timeout
     pub fn read_event_timeout(&mut self, timeout: Duration) -> Result<Option<Event>> {
         let mut buf = [0u8; 20];
-        if !poll_read(self.file.as_raw_fd(), self.wake_fd, &mut buf, timeout)? {
+        if !poll_read(self.file.as_raw_fd(), self.wake_fd, self.control_fd, &mut buf, timeout)? {
             return Ok(None);
         }
         Ok(parse_report(&buf))
@@ -265,14 +287,19 @@ impl Device {
 
 }
 
-/// Poll the device fd (and optional wake fd) for readability, then read one
-/// report. Returns:
+/// Poll the device fd (and optional wake/control fds) for readability, then
+/// read one report. Returns:
 /// - `Ok(true)` if `buf` was filled from the device fd
-/// - `Ok(false)` if the timeout expired
-/// - `Err(_)` if the wake fd fired, the device EOFed, or a real I/O error
+/// - `Ok(false)` if the timeout expired, or the control fd fired (there is
+///   no HID data to report either way; on an infinite timeout, reaching
+///   `Ok(false)` means the control fd fired, since the timeout itself can't
+///   expire)
+/// - `Err(_)` if the wake fd fired (disconnect), the device EOFed, or a
+///   real I/O error occurred
 fn poll_read(
     dev_fd: std::os::fd::RawFd,
     wake_fd: Option<std::os::fd::RawFd>,
+    control_fd: Option<std::os::fd::RawFd>,
     buf: &mut [u8; 20],
     timeout: Duration,
 ) -> Result<bool> {
@@ -283,8 +310,21 @@ fn poll_read(
             events: libc::POLLIN,
             revents: 0,
         },
+        libc::pollfd {
+            fd: control_fd.unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
-    let nfds = if wake_fd.is_some() { 2 } else { 1 };
+    // Only ask poll() to look at as many entries as are actually in use;
+    // entries beyond that stay at fd -1 and are never touched.
+    let nfds = if control_fd.is_some() {
+        3
+    } else if wake_fd.is_some() {
+        2
+    } else {
+        1
+    };
 
     // poll() takes milliseconds as int. Duration::MAX would overflow, so
     // cap to -1 (infinite wait) for effectively-infinite timeouts.
@@ -309,6 +349,13 @@ fn poll_read(
     // Wake fd fired - treat as disconnect. Caller handles the reconnect.
     if wake_fd.is_some() && pfds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
         bail!("wake fd signalled disconnect");
+    }
+
+    // Control fd fired - a request is waiting on the control channel. This
+    // is not a disconnect, so just report "no data" and let the caller
+    // check the channel.
+    if control_fd.is_some() && pfds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        return Ok(false);
     }
 
     // Device fd error/hangup - stale fd after USB removal

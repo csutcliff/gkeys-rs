@@ -15,7 +15,9 @@
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -93,16 +95,24 @@ pub fn socket_path() -> PathBuf {
 /// A background thread accepting control-socket connections. Held for the
 /// life of the daemon; dropping it (including via an early return during
 /// shutdown) removes the socket file, same as a clean exit should.
+///
+/// Also owns the read end of a self-pipe: the accept thread writes a byte
+/// to it after queuing a request, the same wake pattern `udev_watcher` uses
+/// for disconnect events. `Device` polls this fd alongside the hidraw fd so
+/// a blocking read breaks out the instant a control request arrives instead
+/// of waiting on the next keyboard event.
 pub struct ControlListener {
     path: PathBuf,
+    wake_rx: OwnedFd,
     _thread: thread::JoinHandle<()>,
 }
 
 impl ControlListener {
     /// Bind the control socket and start accepting connections on a
-    /// dedicated thread. Each parsed request is forwarded to `tx`; the
-    /// socket thread then waits (bounded by `REPLY_TIMEOUT`) for the main
-    /// loop to send back a reply, and writes it to the client.
+    /// dedicated thread. Each parsed request is forwarded to `tx` and the
+    /// wake pipe is nudged; the socket thread then waits (bounded by
+    /// `REPLY_TIMEOUT`) for the main loop to send back a reply, and writes
+    /// it to the client.
     pub fn new(tx: Sender<ControlRequest>) -> Result<Self> {
         let path = socket_path();
 
@@ -120,18 +130,49 @@ impl ControlListener {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("failed to set permissions on {}", path.display()))?;
 
+        let (wake_rx, wake_tx) = make_pipe()?;
+        // Convert the write end into a File the accept thread can write to;
+        // it now owns the fd (no double-close on drop).
+        let wake_tx = unsafe { fs::File::from_raw_fd(wake_tx.into_raw_fd()) };
+
         let thread_path = path.clone();
         let thread = thread::Builder::new()
             .name("control-listener".into())
-            .spawn(move || accept_loop(listener, tx, thread_path))
+            .spawn(move || accept_loop(listener, tx, wake_tx, thread_path))
             .context("failed to spawn control-listener thread")?;
 
-        Ok(Self { path, _thread: thread })
+        Ok(Self { path, wake_rx, _thread: thread })
     }
 
     /// Path the socket is bound at, for logging.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Raw fd that becomes readable when a control request has been queued
+    /// for the main loop. Passed into `Device` alongside the udev watcher's
+    /// wake fd.
+    pub fn wake_fd(&self) -> RawFd {
+        self.wake_rx.as_raw_fd()
+    }
+
+    /// Drain any pending wake bytes so bursts of requests (or one that
+    /// wasn't yet acted on) don't cause repeated spurious wakes once the
+    /// corresponding channel messages have already been drained.
+    pub fn drain(&self) {
+        let fd = self.wake_rx.as_raw_fd();
+        let mut buf = [0u8; 64];
+        loop {
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ret = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ret <= 0 {
+                break;
+            }
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
     }
 }
 
@@ -143,13 +184,25 @@ impl Drop for ControlListener {
     }
 }
 
+fn make_pipe() -> Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // O_CLOEXEC so we don't leak fds into child processes spawned by macros
+    let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error()).context("pipe2 failed");
+    }
+    let rx = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let tx = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((rx, tx))
+}
+
 /// Accept connections until the listener errors out unrecoverably. Not
 /// explicitly joined or signalled to stop; it ends with the process on
 /// shutdown, same as the udev watcher thread.
-fn accept_loop(listener: UnixListener, tx: Sender<ControlRequest>, path: PathBuf) {
+fn accept_loop(listener: UnixListener, tx: Sender<ControlRequest>, mut wake_tx: fs::File, path: PathBuf) {
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle_connection(stream, &tx),
+            Ok(stream) => handle_connection(stream, &tx, &mut wake_tx),
             Err(e) => log::warn!("control socket accept error: {}", e),
         }
     }
@@ -160,7 +213,7 @@ fn accept_loop(listener: UnixListener, tx: Sender<ControlRequest>, path: PathBuf
 /// valid command to the main loop and wait for its reply, then write the
 /// response line back. Malformed input never reaches the main loop at all,
 /// so a client sending garbage can't affect the daemon.
-fn handle_connection(stream: UnixStream, tx: &Sender<ControlRequest>) {
+fn handle_connection(stream: UnixStream, tx: &Sender<ControlRequest>, wake_tx: &mut fs::File) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
@@ -186,6 +239,10 @@ fn handle_connection(stream: UnixStream, tx: &Sender<ControlRequest>) {
             if tx.send(ControlRequest { command, reply: reply_tx }).is_err() {
                 "err daemon shutting down".to_string()
             } else {
+                // Wake the main loop's blocking read so it notices this
+                // request immediately instead of waiting for the next
+                // keyboard event or a disconnect.
+                let _ = wake_tx.write_all(&[1u8]);
                 match reply_rx.recv_timeout(REPLY_TIMEOUT) {
                     Ok(response) => response,
                     Err(_) => "err timed out waiting for daemon".to_string(),

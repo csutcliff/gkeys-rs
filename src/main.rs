@@ -28,13 +28,6 @@ use udev_watcher::UdevWatcher;
 /// Number of quick flashes on successful recording
 const MR_QUICK_FLASH_COUNT: u8 = 4;
 
-/// How often the main loop wakes up when idle (not recording) to check for
-/// pending control-socket requests. `read_event_blocking`'s previous
-/// indefinite block has been replaced with this bounded poll so
-/// `--set-profile` takes effect promptly instead of waiting for the next
-/// G-key/M-key press or a disconnect.
-const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(200);
-
 fn main() -> Result<()> {
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(exit_code) = control::maybe_run_client(&cli_args) {
@@ -97,7 +90,7 @@ fn main() -> Result<()> {
     // effort, like the udev watcher above - a user with no interest in this
     // stays entirely unaffected if it can't be set up.
     let (control_tx, control_rx) = mpsc::channel::<ControlRequest>();
-    let _control_listener = match ControlListener::new(control_tx) {
+    let control_listener = match ControlListener::new(control_tx) {
         Ok(listener) => {
             log::info!("Control socket listening at {}", listener.path().display());
             Some(listener)
@@ -107,6 +100,7 @@ fn main() -> Result<()> {
             None
         }
     };
+    let control_wake_fd = control_listener.as_ref().map(|c| c.wake_fd());
 
     // Outer loop handles device reconnection
     let mut reconnect_delay = Duration::from_secs(1);
@@ -118,6 +112,9 @@ fn main() -> Result<()> {
         if let Some(ref w) = udev {
             w.drain();
         }
+        if let Some(ref c) = control_listener {
+            c.drain();
+        }
 
         // Apply any profile-switch requests that arrived over the control
         // socket while no keyboard was attached. There's no LedController
@@ -127,7 +124,7 @@ fn main() -> Result<()> {
         drain_control_messages(&control_rx, &mut current_profile, &config, None);
 
         // Try to open device
-        let mut device = match Device::open(wake_fd) {
+        let mut device = match Device::open(wake_fd, control_wake_fd) {
             Ok(d) => {
                 log::info!("Opened device: {}", d.path().display());
                 reconnect_delay = Duration::from_secs(1); // Reset delay on success
@@ -191,12 +188,15 @@ fn main() -> Result<()> {
             // control socket. try_recv is non-blocking so this never stalls
             // the loop.
             drain_control_messages(&control_rx, &mut current_profile, &config, Some(led));
+            if let Some(ref c) = control_listener {
+                c.drain();
+            }
 
             // Use timeout read so we can poll captured keys during recording
             let event_result = if recorder.is_recording() {
                 device.read_event() // 100ms timeout
             } else {
-                device.read_event_timeout(CONTROL_POLL_INTERVAL) // bounded so control-socket requests are noticed promptly
+                device.read_event_blocking() // blocking read, woken by keyboard I/O, disconnect, or a queued control request
             };
 
             match event_result {
