@@ -14,7 +14,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
@@ -29,6 +29,19 @@ use anyhow::{Context, Result};
 /// How long a client waits for the main loop to process its request before
 /// giving up. Bounded so a wedged main loop can't hang a caller forever.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the socket thread waits for a client to finish sending its
+/// request line. A local client sending a handful of bytes needs a fraction
+/// of this; the point is bounding a client that connects and then never
+/// writes a newline (killed at the wrong moment, or just probing the
+/// socket), which would otherwise wedge the accept thread, and with it
+/// every other client, forever (connections are handled one at a time).
+const READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum bytes read while looking for the request line's newline.
+/// Real commands are a handful of bytes; this just bounds a client that
+/// streams data without ever sending one.
+const MAX_LINE_BYTES: u64 = 256;
 
 /// A parsed control-socket command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,6 +222,52 @@ fn accept_loop(listener: UnixListener, tx: Sender<ControlRequest>, mut wake_tx: 
     log::debug!("control listener at {} stopped accepting", path.display());
 }
 
+/// Outcome of trying to read one request line from a client connection.
+#[derive(Debug)]
+enum LineRead {
+    /// A full line was read (including its trailing newline, when present).
+    Line(String),
+    /// The client didn't finish sending a line within the timeout.
+    TimedOut,
+    /// The client sent more than the allowed number of bytes without a
+    /// newline in them.
+    TooLong,
+    /// The client closed the connection without sending anything.
+    Empty,
+}
+
+/// Read one request line from `stream`, bounded by `timeout` and `max_len`.
+/// Split out from `handle_connection` so the timeout and length-cap logic
+/// can be exercised directly against a real socket pair in tests, with
+/// smaller limits than the daemon uses in practice.
+fn read_request_line(stream: &UnixStream, timeout: Duration, max_len: u64) -> io::Result<LineRead> {
+    stream.set_read_timeout(Some(timeout))?;
+
+    let mut reader = BufReader::new(stream).take(max_len);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(_) => {}
+        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+            return Ok(LineRead::TimedOut);
+        }
+        Err(e) => return Err(e),
+    }
+
+    if line.is_empty() {
+        return Ok(LineRead::Empty);
+    }
+    // Take reports EOF once its allowance is used up, whether or not the
+    // client actually stopped sending, so read_line can return a line-sized
+    // chunk with no trailing newline for either reason. Treating that as
+    // "too long" only when the allowance is fully spent (rather than on
+    // "no newline" alone) keeps a genuinely short, newline-less line - the
+    // client closing right after a partial write - from being misreported.
+    if reader.limit() == 0 && !line.ends_with('\n') {
+        return Ok(LineRead::TooLong);
+    }
+    Ok(LineRead::Line(line))
+}
+
 /// Handle one client connection: read a single line, parse it, forward a
 /// valid command to the main loop and wait for its reply, then write the
 /// response line back. Malformed input never reaches the main loop at all,
@@ -221,17 +280,30 @@ fn handle_connection(stream: UnixStream, tx: &Sender<ControlRequest>, wake_tx: &
             return;
         }
     };
-    let mut reader = BufReader::new(stream);
 
-    let mut line = String::new();
-    if let Err(e) = reader.read_line(&mut line) {
-        log::warn!("control socket: read failed: {}", e);
-        return;
-    }
-    if line.is_empty() {
-        // Client connected and disconnected without sending anything.
-        return;
-    }
+    let line = match read_request_line(&stream, READ_TIMEOUT, MAX_LINE_BYTES) {
+        Ok(LineRead::Line(line)) => line,
+        Ok(LineRead::Empty) => return, // client disconnected without sending anything
+        Ok(LineRead::TimedOut) => {
+            log::debug!(
+                "control socket: client took longer than {:?} to send a line, dropping connection",
+                READ_TIMEOUT
+            );
+            return;
+        }
+        Ok(LineRead::TooLong) => {
+            log::debug!(
+                "control socket: line exceeded {} bytes without a newline, dropping connection",
+                MAX_LINE_BYTES
+            );
+            let _ = writeln!(writer, "err line too long");
+            return;
+        }
+        Err(e) => {
+            log::warn!("control socket: read failed: {}", e);
+            return;
+        }
+    };
 
     let response = match parse_command(&line) {
         Ok(command) => {
@@ -355,5 +427,56 @@ mod tests {
     fn rejects_empty_line() {
         assert!(parse_command("").is_err());
         assert!(parse_command("   ").is_err());
+    }
+
+    // read_request_line's timeout and length-cap logic depends on real
+    // socket behaviour (SO_RCVTIMEO, EOF-on-close), so these run against a
+    // genuine UnixStream::pair() rather than a hand-rolled mock, with much
+    // smaller limits than the daemon uses so the suite stays fast.
+
+    #[test]
+    fn read_request_line_returns_a_full_line() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            b.write_all(b"profile 1\n").unwrap();
+        });
+
+        let result = read_request_line(&a, Duration::from_secs(1), 256).unwrap();
+        writer.join().unwrap();
+
+        match result {
+            LineRead::Line(line) => assert_eq!(line, "profile 1\n"),
+            other => panic!("expected Line, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn read_request_line_times_out_when_client_sends_nothing() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        // _b is kept alive (not dropped) so `a` sees an open connection with
+        // no data, not EOF, and genuinely has to wait out the timeout.
+        let result = read_request_line(&a, Duration::from_millis(50), 256).unwrap();
+        assert!(matches!(result, LineRead::TimedOut));
+    }
+
+    #[test]
+    fn read_request_line_rejects_a_line_past_the_cap() {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let writer = thread::spawn(move || {
+            b.write_all(&vec![b'x'; 300]).unwrap();
+        });
+
+        let result = read_request_line(&a, Duration::from_secs(1), 256).unwrap();
+        writer.join().unwrap();
+
+        assert!(matches!(result, LineRead::TooLong));
+    }
+
+    #[test]
+    fn read_request_line_reports_empty_on_immediate_close() {
+        let (a, b) = UnixStream::pair().unwrap();
+        drop(b);
+        let result = read_request_line(&a, Duration::from_secs(1), 256).unwrap();
+        assert!(matches!(result, LineRead::Empty));
     }
 }
