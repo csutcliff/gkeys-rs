@@ -254,18 +254,6 @@ impl Device {
         self.read_event_timeout(Duration::from_millis(100))
     }
 
-    /// Read and parse a HID event, blocking until one arrives, the wake fd
-    /// becomes readable, or an I/O error occurs. On wake-fd trigger or EOF
-    /// this returns a disconnect error so the caller reconnects.
-    pub fn read_event_blocking(&mut self) -> Result<Option<Event>> {
-        let mut buf = [0u8; 20];
-        if !poll_read(self.file.as_raw_fd(), self.wake_fd, &mut buf, Duration::MAX)? {
-            // Wake fd fired (or EOF/timeout hit with MAX which shouldn't).
-            bail!("device disconnected (wake fd signalled)");
-        }
-        Ok(parse_report(&buf))
-    }
-
     /// Read and parse a HID event with specified timeout
     pub fn read_event_timeout(&mut self, timeout: Duration) -> Result<Option<Event>> {
         let mut buf = [0u8; 20];

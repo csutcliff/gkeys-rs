@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod device;
 mod events;
 mod led;
@@ -8,6 +9,7 @@ mod udev_watcher;
 mod uinput;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +17,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use config::{Config, HotkeyType, Macro};
+use control::{ControlCommand, ControlListener, ControlRequest};
 use device::Device;
 use events::Event;
 use led::LedController;
@@ -25,7 +28,19 @@ use udev_watcher::UdevWatcher;
 /// Number of quick flashes on successful recording
 const MR_QUICK_FLASH_COUNT: u8 = 4;
 
+/// How often the main loop wakes up when idle (not recording) to check for
+/// pending control-socket requests. `read_event_blocking`'s previous
+/// indefinite block has been replaced with this bounded poll so
+/// `--set-profile` takes effect promptly instead of waiting for the next
+/// G-key/M-key press or a disconnect.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 fn main() -> Result<()> {
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(exit_code) = control::maybe_run_client(&cli_args) {
+        std::process::exit(exit_code);
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     log::info!("gkeys-rs starting");
@@ -77,6 +92,22 @@ fn main() -> Result<()> {
     };
     let wake_fd = udev.as_ref().map(|w| w.wake_fd());
 
+    // Control socket: lets an external program (e.g. a KVM-switch focus
+    // hook) request a profile switch without touching the keyboard. Best
+    // effort, like the udev watcher above - a user with no interest in this
+    // stays entirely unaffected if it can't be set up.
+    let (control_tx, control_rx) = mpsc::channel::<ControlRequest>();
+    let _control_listener = match ControlListener::new(control_tx) {
+        Ok(listener) => {
+            log::info!("Control socket listening at {}", listener.path().display());
+            Some(listener)
+        }
+        Err(e) => {
+            log::warn!("Control socket unavailable: {} - continuing without it", e);
+            None
+        }
+    };
+
     // Outer loop handles device reconnection
     let mut reconnect_delay = Duration::from_secs(1);
     let max_reconnect_delay = Duration::from_secs(30);
@@ -87,6 +118,13 @@ fn main() -> Result<()> {
         if let Some(ref w) = udev {
             w.drain();
         }
+
+        // Apply any profile-switch requests that arrived over the control
+        // socket while no keyboard was attached. There's no LedController
+        // to update yet, but the state change takes effect immediately and
+        // the LED catches up via the profile sync below once a device
+        // connects.
+        drain_control_messages(&control_rx, &mut current_profile, &config, None);
 
         // Try to open device
         let mut device = match Device::open(wake_fd) {
@@ -149,11 +187,16 @@ fn main() -> Result<()> {
                 recorder.poll_captured_keys();
             }
 
+            // Apply any profile-switch requests that arrived over the
+            // control socket. try_recv is non-blocking so this never stalls
+            // the loop.
+            drain_control_messages(&control_rx, &mut current_profile, &config, Some(led));
+
             // Use timeout read so we can poll captured keys during recording
             let event_result = if recorder.is_recording() {
                 device.read_event() // 100ms timeout
             } else {
-                device.read_event_blocking() // Blocking read when not recording
+                device.read_event_timeout(CONTROL_POLL_INTERVAL) // bounded so control-socket requests are noticed promptly
             };
 
             match event_result {
@@ -193,6 +236,62 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Drain and apply any pending control-socket requests. Uses `try_recv` so
+/// it never blocks the caller; called once per main-loop iteration both
+/// while a device is connected and while the outer loop is between
+/// (re)connection attempts, so a request isn't lost or left waiting behind
+/// a stalled device open.
+fn drain_control_messages(
+    rx: &mpsc::Receiver<ControlRequest>,
+    current_profile: &mut String,
+    config: &Config,
+    led: Option<&LedController>,
+) {
+    while let Ok(request) = rx.try_recv() {
+        match request.command {
+            ControlCommand::SetProfile(n) => {
+                apply_profile(n, current_profile, config, led);
+                request.respond("ok");
+            }
+        }
+    }
+}
+
+/// Switch to the given memory profile: updates `current_profile`, the M-key
+/// LED (if a controller is available) and sends the desktop notification if
+/// enabled. This is exactly what happens on a physical M-key press
+/// (`handle_event`'s `Event::MKey` arm below) and a control-socket
+/// `profile <n>` request; both call this so the two paths can't drift.
+///
+/// `led` is `None` when no keyboard is currently attached. The profile
+/// state still updates in that case (and is picked up by the LED the next
+/// time the keyboard reconnects, via the profile sync in `main`), but there
+/// is obviously no LED to write to in the meantime.
+fn apply_profile(n: u8, current_profile: &mut String, config: &Config, led: Option<&LedController>) {
+    let new_profile = format!("MEMORY_{}", n);
+    // Only switch if different (prevents a feedback loop from the LED
+    // response on a physical press, and makes a repeat request for the
+    // already-active profile a harmless no-op).
+    if *current_profile == new_profile {
+        return;
+    }
+    log::info!("Switching to profile M{}", n);
+    *current_profile = new_profile;
+
+    if let Some(led) = led {
+        led.set_profile_led(n);
+    }
+
+    if config.notify.0 {
+        // Send desktop notification
+        let _ = std::process::Command::new("notify-send")
+            .arg("-a")
+            .arg("gkeys-rs")
+            .arg(format!("Profile M{}", n))
+            .spawn();
+    }
+}
+
 fn handle_event(
     event: &Event,
     config: &Config,
@@ -217,24 +316,8 @@ fn handle_event(
             log::trace!("G-key released");
         }
         Event::MKey(n) => {
-            let new_profile = format!("MEMORY_{}", n);
-            log::debug!("M{} pressed, current='{}', new='{}'", n, current_profile, new_profile);
-            // Only switch if different (prevents feedback loop from LED response)
-            if *current_profile != new_profile {
-                log::info!("Switching to profile M{}", n);
-                *current_profile = new_profile.clone();
-
-                led.set_profile_led(*n);
-
-                if config.notify.0 {
-                    // Send desktop notification
-                    let _ = std::process::Command::new("notify-send")
-                        .arg("-a")
-                        .arg("gkeys-rs")
-                        .arg(format!("Profile M{}", n))
-                        .spawn();
-                }
-            }
+            log::debug!("M{} pressed, current='{}'", n, current_profile);
+            apply_profile(*n, current_profile, config, Some(led));
         }
         Event::MKeyRelease => {
             log::trace!("M-key released");

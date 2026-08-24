@@ -171,6 +171,46 @@ Record key sequences directly on the keyboard without editing the config file.
 - Press MR twice quickly (without selecting a G-key) to cancel
 - Recording with no keys captured shows a cancellation notification
 
+## Control Socket
+
+The daemon listens on a Unix socket so an external program can request a
+profile switch without touching the keyboard's physical M keys, for example
+to reset to M1 from a script that runs when a KVM switch brings focus back
+to this machine.
+
+- **Path**: `$XDG_RUNTIME_DIR/gkeys-rs.sock`, or `/tmp/gkeys-rs-<uid>.sock`
+  if `XDG_RUNTIME_DIR` isn't set. Mode `0600` (owner only).
+- **Setup is best effort**: if the socket can't be created, the daemon logs
+  a warning and keeps running as normal. This feature is entirely optional.
+- **Protocol**: one line in, one line out, one command per connection.
+
+  | Request | Response |
+  |---------|----------|
+  | `profile <1\|2\|3>` | `ok`, or `err <reason>` |
+
+Applying a profile switch over the socket does exactly what pressing the
+corresponding M key does: it updates the active profile, the M-key LED, and
+sends the desktop notification if `notify` is enabled.
+
+### `--set-profile`
+
+The same binary doubles as a client, so there is nothing extra to install:
+
+```bash
+gkeys-rs --set-profile 1
+```
+
+Prints the daemon's reply and exits `0` on `ok`, non-zero otherwise
+(including when no daemon is running). This takes no other arguments and
+does not start the daemon.
+
+**Example** - reset to M1 whenever this machine regains focus from a KVM
+switch, by calling it from whatever hook fires on that event:
+
+```bash
+gkeys-rs --set-profile 1
+```
+
 ## Requirements
 
 - User must be in `input` group (for hidraw access) or use appropriate udev rules

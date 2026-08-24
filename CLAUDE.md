@@ -38,7 +38,7 @@ Rust 2024 edition, MSRV 1.85. Single-binary daemon using hidraw directly (not li
 
 | File | Purpose |
 |------|---------|
-| `main.rs` | Entry point, device scan loop, reconnection with exponential backoff |
+| `main.rs` | Entry point, CLI arg dispatch, device scan loop, reconnection with exponential backoff |
 | `device.rs` | hidraw device discovery (scans `/sys/class/hidraw` for vendor `046d` product `c33f` interface 1) |
 | `events.rs` | HID report parsing (20-byte reports, prefix `11 ff`, byte 2 = event type) |
 | `macros.rs` | Macro execution (run, shortcut, typeout, uinput, sequence, nothing) |
@@ -46,6 +46,7 @@ Rust 2024 edition, MSRV 1.85. Single-binary daemon using hidraw directly (not li
 | `config.rs` | JSON config loading from `~/.config/gkeys-rs/config.json` |
 | `led.rs` | M-key LED control and keyboard RGB (direct hidraw writes, command `11 ff 0b 1c <mask>`) |
 | `uinput.rs` | Virtual input device for key injection |
+| `control.rs` | Unix control socket + `--set-profile` client (see below) |
 
 ### Key Design Points
 
@@ -55,6 +56,7 @@ Rust 2024 edition, MSRV 1.85. Single-binary daemon using hidraw directly (not li
 - **Profile switching**: M1/M2/M3 keys switch between `MEMORY_1`/`MEMORY_2`/`MEMORY_3` config sections
 - **Auto-reconnection**: Survives KVM switches, monitor standby, USB resets
 - **HID buffer drain**: After initialization and LED setup, the keyboard queues HID response reports in the hidraw buffer. These are drained before entering the event loop to prevent phantom G-key events (e.g., G1 firing on every boot). The MR LED has separate debounce logic (`is_mr_event_from_led`) for phantom events caused by LED writes during normal operation.
+- **Control socket** (`control.rs`): a background thread (`ControlListener`) accepts connections on a Unix socket (`$XDG_RUNTIME_DIR/gkeys-rs.sock`, falling back to `/tmp/gkeys-rs-<uid>.sock`) and forwards parsed requests to the main loop over an `mpsc` channel (`ControlRequest`), same pattern as the udev watcher's wake pipe. Socket setup is best effort: a bind failure is logged as a warning and the daemon runs on without it. The main loop drains the channel with `try_recv` at two points: once per outer-loop iteration between (re)connection attempts (no `LedController` available yet, so only the profile state updates), and once per inner-loop iteration while a device is connected. Applying a switch goes through `apply_profile`, the same helper `handle_event`'s `Event::MKey` arm calls, so the socket path and a physical M-key press can't drift apart. Because control messages need to be noticed while idle, the inner loop's previously-infinite blocking read (`read_event_blocking`, now removed) was replaced with a bounded poll (`read_event_timeout(CONTROL_POLL_INTERVAL)`, 200ms) when not recording; the udev wake-fd behaviour for disconnect detection is unchanged. `gkeys-rs --set-profile <n>` is a thin client in the same binary: it connects to the socket, sends `profile <n>`, and prints the daemon's reply.
 
 ### Configuration Notes
 
