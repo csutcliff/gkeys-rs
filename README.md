@@ -178,8 +178,18 @@ profile switch without touching the keyboard's physical M keys, for example
 to reset to M1 from a script that runs when a KVM switch brings focus back
 to this machine.
 
-- **Path**: `$XDG_RUNTIME_DIR/gkeys-rs.sock`, or `/tmp/gkeys-rs-<uid>.sock`
-  if `XDG_RUNTIME_DIR` isn't set. Mode `0600` (owner only).
+- **Path**: resolved the same way by the daemon and by `--set-profile`, in
+  order:
+  1. `$XDG_RUNTIME_DIR/gkeys-rs.sock`, if that variable is set and non-empty.
+  2. `/run/user/<uid>/gkeys-rs.sock`, if that directory exists. A caller
+     outside a logind session, such as a udev rule run via `systemd-run`, a
+     cron job, a system unit, or a script run over ssh with no session,
+     does not have `XDG_RUNTIME_DIR` set even though the directory (and the
+     daemon's socket in it) already exists, so this fallback is what lets
+     it still find the right socket.
+  3. `/tmp/gkeys-rs-<uid>.sock`, if neither of the above is available.
+
+  Mode `0600` (owner only) either way.
 - **Setup is best effort**: if the socket can't be created, the daemon logs
   a warning and keeps running as normal. This feature is entirely optional.
 - **Protocol**: one line in, one line out, one command per connection.

@@ -94,15 +94,72 @@ pub fn parse_command(line: &str) -> Result<ControlCommand, String> {
     }
 }
 
-/// Where the control socket lives: `$XDG_RUNTIME_DIR/gkeys-rs.sock`, or
-/// `/tmp/gkeys-rs-<uid>.sock` if `XDG_RUNTIME_DIR` isn't set.
+/// Where the control socket lives. Both the daemon (`ControlListener::new`)
+/// and the client (`run_set_profile`) call this, so they can't disagree
+/// about the path: resolution order, checked in order:
+///
+/// 1. `$XDG_RUNTIME_DIR/gkeys-rs.sock`, if the variable is set and
+///    non-empty.
+/// 2. `/run/user/<uid>/gkeys-rs.sock`, if that directory exists. This is
+///    the directory a logind session's `XDG_RUNTIME_DIR` normally points
+///    at, but the variable itself is only set inside a logind session. A
+///    caller outside one, such as a udev rule invoked via `systemd-run`, a
+///    cron job, a system unit, or a script run over ssh with no session,
+///    does not have it set even though the directory (and the daemon's
+///    socket in it) already exists, so this fallback is what lets such a
+///    caller still find the right socket.
+/// 3. `/tmp/gkeys-rs-<uid>.sock`, if neither of the above is available.
+///
+/// Uses the effective uid throughout, for both the `/run/user` path and
+/// the final fallback filename.
 pub fn socket_path() -> PathBuf {
-    if let Some(dir) = env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("gkeys-rs.sock")
-    } else {
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/gkeys-rs-{}.sock", uid))
+    let uid = unsafe { libc::geteuid() };
+    resolve_socket_path(env::var_os("XDG_RUNTIME_DIR").as_deref(), run_user_dir_exists(uid), uid)
+}
+
+/// Whether `/run/user/<uid>` exists. Split out from `resolve_socket_path`
+/// so the resolution order itself can be unit tested without touching the
+/// filesystem or requiring a real `/run/user` entry.
+fn run_user_dir_exists(uid: libc::uid_t) -> bool {
+    Path::new(&format!("/run/user/{}", uid)).is_dir()
+}
+
+/// Pure resolution logic behind `socket_path`. See its doc comment for the
+/// order; kept separate so tests can drive it with values that would
+/// otherwise need root or a specific logind/session state to produce.
+fn resolve_socket_path(xdg_runtime_dir: Option<&std::ffi::OsStr>, run_user_dir_exists: bool, uid: libc::uid_t) -> PathBuf {
+    if let Some(dir) = xdg_runtime_dir {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("gkeys-rs.sock");
+        }
     }
+    if run_user_dir_exists {
+        return PathBuf::from(format!("/run/user/{}", uid)).join("gkeys-rs.sock");
+    }
+    PathBuf::from(format!("/tmp/gkeys-rs-{}.sock", uid))
+}
+
+/// One line per resolution step, for the client's "daemon does not appear
+/// to be running" message: someone hitting a path mismatch again should be
+/// able to see why from the message alone, without needing to already know
+/// this function's internals.
+fn describe_socket_resolution(uid: libc::uid_t) -> String {
+    let xdg = env::var_os("XDG_RUNTIME_DIR");
+    let xdg_desc = match xdg.as_deref() {
+        Some(dir) if !dir.is_empty() => format!("$XDG_RUNTIME_DIR is set to {}", PathBuf::from(dir).display()),
+        Some(_) => "$XDG_RUNTIME_DIR is set but empty".to_string(),
+        None => "$XDG_RUNTIME_DIR is not set".to_string(),
+    };
+    let run_user = format!("/run/user/{}", uid);
+    let run_user_desc = if run_user_dir_exists(uid) {
+        format!("{} exists", run_user)
+    } else {
+        format!("{} does not exist", run_user)
+    };
+    format!(
+        "{}; {}; falls back to /tmp/gkeys-rs-{}.sock",
+        xdg_desc, run_user_desc, uid
+    )
 }
 
 /// A background thread accepting control-socket connections. Held for the
@@ -363,11 +420,13 @@ fn run_set_profile(n: &str) -> i32 {
     let mut stream = match UnixStream::connect(&path) {
         Ok(s) => s,
         Err(e) => {
+            let uid = unsafe { libc::geteuid() };
             eprintln!(
                 "gkeys-rs: daemon does not appear to be running (no control socket at {}): {}",
                 path.display(),
                 e
             );
+            eprintln!("gkeys-rs: resolution order checked: {}", describe_socket_resolution(uid));
             return 1;
         }
     };
@@ -396,6 +455,54 @@ fn run_set_profile(n: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    // resolve_socket_path is pure (no env or filesystem access of its own),
+    // so the resolution order is tested directly with values a real
+    // XDG_RUNTIME_DIR / /run/user state would produce, without needing root
+    // or creating anything under /run/user.
+
+    #[test]
+    fn resolve_uses_xdg_runtime_dir_when_set() {
+        let path = resolve_socket_path(Some(OsStr::new("/run/user/1000")), true, 1000);
+        assert_eq!(path, PathBuf::from("/run/user/1000/gkeys-rs.sock"));
+    }
+
+    #[test]
+    fn resolve_prefers_xdg_runtime_dir_over_run_user_fallback() {
+        // An explicit XDG_RUNTIME_DIR should win even when /run/user/<uid>
+        // also exists: it may legitimately point somewhere else entirely
+        // (a container, a sandbox).
+        let path = resolve_socket_path(Some(OsStr::new("/custom/runtime")), true, 1000);
+        assert_eq!(path, PathBuf::from("/custom/runtime/gkeys-rs.sock"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_run_user_dir_when_unset() {
+        let path = resolve_socket_path(None, true, 1000);
+        assert_eq!(path, PathBuf::from("/run/user/1000/gkeys-rs.sock"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_run_user_dir_when_empty() {
+        let path = resolve_socket_path(Some(OsStr::new("")), true, 1000);
+        assert_eq!(path, PathBuf::from("/run/user/1000/gkeys-rs.sock"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_tmp_when_nothing_else_available() {
+        let path = resolve_socket_path(None, false, 1000);
+        assert_eq!(path, PathBuf::from("/tmp/gkeys-rs-1000.sock"));
+    }
+
+    #[test]
+    fn resolve_empty_xdg_and_no_run_user_dir_falls_to_tmp() {
+        // Guards against a regression producing an empty path or something
+        // like "/gkeys-rs.sock" when XDG_RUNTIME_DIR is set-but-empty and
+        // /run/user/<uid> isn't there either.
+        let path = resolve_socket_path(Some(OsStr::new("")), false, 1000);
+        assert_eq!(path, PathBuf::from("/tmp/gkeys-rs-1000.sock"));
+    }
 
     #[test]
     fn parses_valid_profile() {
