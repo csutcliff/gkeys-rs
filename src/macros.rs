@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use anyhow::Result;
 
 use crate::config::{HotkeyType, Macro};
+use crate::proc::spawn_reaped;
 use crate::uinput::VirtualKeyboard;
 
 pub struct MacroExecutor {
@@ -32,13 +33,14 @@ impl MacroExecutor {
     /// Run a shell command
     fn run_command(&self, cmd: &str) -> Result<()> {
         log::debug!("Running command: {}", cmd);
-        Command::new("/bin/sh")
-            .arg("-c")
-            .arg(cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        spawn_reaped(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(cmd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )?;
         Ok(())
     }
 

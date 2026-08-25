@@ -4,6 +4,7 @@ mod device;
 mod events;
 mod led;
 mod macros;
+mod proc;
 mod recording;
 mod udev_watcher;
 mod uinput;
@@ -22,6 +23,7 @@ use device::Device;
 use events::Event;
 use led::LedController;
 use macros::MacroExecutor;
+use proc::spawn_reaped;
 use recording::{Recorder, RecordingAction};
 use udev_watcher::UdevWatcher;
 
@@ -284,11 +286,12 @@ fn apply_profile(n: u8, current_profile: &mut String, config: &Config, led: Opti
 
     if config.notify.0 {
         // Send desktop notification
-        let _ = std::process::Command::new("notify-send")
-            .arg("-a")
-            .arg("gkeys-rs")
-            .arg(format!("Profile M{}", n))
-            .spawn();
+        let _ = spawn_reaped(
+            std::process::Command::new("notify-send")
+                .arg("-a")
+                .arg("gkeys-rs")
+                .arg(format!("Profile M{}", n)),
+        );
     }
 }
 
@@ -378,14 +381,12 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
             led.start_mr_flashing();
 
             log::debug!("Recording G{} - G-key red, MR flashing", gkey);
-            let _ = std::process::Command::new("notify-send")
-                .args([
-                    "-a",
-                    "gkeys-rs",
-                    &format!("Recording G{}", gkey),
-                    "Press keys, then MR to stop",
-                ])
-                .spawn();
+            let _ = spawn_reaped(std::process::Command::new("notify-send").args([
+                "-a",
+                "gkeys-rs",
+                &format!("Recording G{}", gkey),
+                "Press keys, then MR to stop",
+            ]));
         }
 
         RecordingAction::SaveMacro {
@@ -412,21 +413,20 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
 
             if let Err(e) = config.save() {
                 log::error!("Failed to save config: {}", e);
-                let _ = std::process::Command::new("notify-send")
-                    .args([
-                        "-a",
-                        "gkeys-rs",
-                        "Recording failed",
-                        &format!("Could not save: {}", e),
-                    ])
-                    .spawn();
+                let _ = spawn_reaped(std::process::Command::new("notify-send").args([
+                    "-a",
+                    "gkeys-rs",
+                    "Recording failed",
+                    &format!("Could not save: {}", e),
+                ]));
                 return;
             }
 
             log::info!("Saved macro G{} = {}", gkey, sequence);
-            let _ = std::process::Command::new("notify-send")
-                .args(["-a", "gkeys-rs", &format!("Recorded G{}", gkey), &sequence])
-                .spawn();
+            let _ = spawn_reaped(
+                std::process::Command::new("notify-send")
+                    .args(["-a", "gkeys-rs", &format!("Recorded G{}", gkey), &sequence]),
+            );
         }
 
         RecordingAction::CancelledEmpty => {
@@ -435,9 +435,12 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
             let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
             led.restore_gkeys_color(gkey_color);
             log::info!("Recording cancelled - no keys captured");
-            let _ = std::process::Command::new("notify-send")
-                .args(["-a", "gkeys-rs", "Recording cancelled", "No keys were captured"])
-                .spawn();
+            let _ = spawn_reaped(std::process::Command::new("notify-send").args([
+                "-a",
+                "gkeys-rs",
+                "Recording cancelled",
+                "No keys were captured",
+            ]));
         }
 
         RecordingAction::CancelledNoGKey => {
@@ -454,9 +457,9 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
             let gkey_color = config.rgb_color.as_ref().map(|c| (c.r, c.g, c.b));
             led.restore_gkeys_color(gkey_color);
             log::error!("Recording error: {}", msg);
-            let _ = std::process::Command::new("notify-send")
-                .args(["-a", "gkeys-rs", "Recording error", &msg])
-                .spawn();
+            let _ = spawn_reaped(
+                std::process::Command::new("notify-send").args(["-a", "gkeys-rs", "Recording error", &msg]),
+            );
         }
     }
 }
