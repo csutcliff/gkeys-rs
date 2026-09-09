@@ -134,7 +134,15 @@ fn main() -> Result<()> {
             }
             Err(e) => {
                 log::warn!("Device open/init failed: {} - retrying in {:?}", e, reconnect_delay);
-                thread::sleep(reconnect_delay);
+                wait_for_retry(
+                    reconnect_delay,
+                    wake_fd,
+                    control_wake_fd,
+                    &control_rx,
+                    &mut current_profile,
+                    &config,
+                    control_listener.as_ref(),
+                );
                 reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
                 continue;
             }
@@ -145,7 +153,15 @@ fn main() -> Result<()> {
             Ok(ctrl) => ctrl,
             Err(e) => {
                 log::error!("Failed to create LED controller: {}", e);
-                thread::sleep(reconnect_delay);
+                wait_for_retry(
+                    reconnect_delay,
+                    wake_fd,
+                    control_wake_fd,
+                    &control_rx,
+                    &mut current_profile,
+                    &config,
+                    control_listener.as_ref(),
+                );
                 reconnect_delay = (reconnect_delay * 2).min(max_reconnect_delay);
                 continue;
             }
@@ -236,6 +252,112 @@ fn main() -> Result<()> {
 
     log::info!("Shutting down");
     Ok(())
+}
+
+/// Why a reconnect backoff wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// udev says a device appeared or vanished: stop waiting and try again.
+    Udev,
+    /// A control request is queued and needs answering now.
+    Control,
+    /// Nothing happened before the deadline.
+    Elapsed,
+    /// A signal cut the poll short. Not an event; the caller works out how
+    /// much of the wait is left and goes back to waiting.
+    Interrupted,
+}
+
+/// Wait up to `timeout` for either watcher to have something to say.
+///
+/// Same `poll()` shape as `device::poll_read`, minus the device fd: this runs
+/// when there is no device to read from.
+fn poll_wake(
+    udev_fd: Option<std::os::fd::RawFd>,
+    control_fd: Option<std::os::fd::RawFd>,
+    timeout: Duration,
+) -> Wake {
+    let mut pfds = [
+        libc::pollfd { fd: udev_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: control_fd.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+    ];
+    let timeout_ms: i32 = timeout.as_millis().min(i32::MAX as u128) as i32;
+
+    let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout_ms) };
+    if ret < 0 {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) => Wake::Interrupted,
+            // Anything else here is a programming error (a bad fd), not a
+            // transient. Report it as elapsed so the caller retries the device
+            // on its normal schedule rather than spinning on poll().
+            _ => Wake::Elapsed,
+        };
+    }
+    if ret == 0 {
+        return Wake::Elapsed;
+    }
+    // udev first: a device that may be back is a better reason to stop waiting
+    // than a queued request, and the request is drained at the top of the outer
+    // loop anyway, before the next open attempt.
+    if udev_fd.is_some() && pfds[0].revents != 0 {
+        return Wake::Udev;
+    }
+    if control_fd.is_some() && pfds[1].revents != 0 {
+        return Wake::Control;
+    }
+    Wake::Elapsed
+}
+
+/// Sit out the reconnect backoff without going deaf for the duration.
+///
+/// This used to be a plain `thread::sleep(reconnect_delay)`, and the delay
+/// doubles to 30s. Two things went wrong in that window, both seen on
+/// 2026-09-10 when the monitor's USB hub power-cycled (the G815 hangs off it,
+/// at 5-3.4.1, so the panel powering down takes the keyboard with it):
+///
+/// - A `--set-profile` request arriving mid-sleep was not read until the sleep
+///   ended, and the daemon's own `REPLY_TIMEOUT` is 5s, so the client was told
+///   `err timed out waiting for daemon` by a daemon that was perfectly healthy
+///   and merely asleep. That is what the panel's colour-profile udev hook hit,
+///   4s after the hub came back.
+/// - The keyboard itself stayed dead for the rest of the sleep after it had
+///   physically returned -- up to 30s of no macros, no G-keys -- because the
+///   udev "device added" wake was not being watched either.
+///
+/// So wait on both fds instead: return early when udev suggests the device is
+/// back, and answer control requests as they arrive without giving up the rest
+/// of the wait.
+#[allow(clippy::too_many_arguments)]
+fn wait_for_retry(
+    delay: Duration,
+    udev_fd: Option<std::os::fd::RawFd>,
+    control_fd: Option<std::os::fd::RawFd>,
+    control_rx: &mpsc::Receiver<ControlRequest>,
+    current_profile: &mut String,
+    config: &Config,
+    listener: Option<&ControlListener>,
+) {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match poll_wake(udev_fd, control_fd, remaining) {
+            Wake::Udev => return,
+            Wake::Control => {
+                if let Some(c) = listener {
+                    c.drain();
+                }
+                // No LedController: there is no device attached, which is the
+                // whole reason we are in the backoff. The profile state still
+                // updates and the LED catches up on reconnect.
+                drain_control_messages(control_rx, current_profile, config, None);
+            }
+            Wake::Interrupted => continue,
+            Wake::Elapsed => return,
+        }
+    }
 }
 
 /// Drain and apply any pending control-socket requests. Uses `try_recv` so
@@ -461,5 +583,93 @@ fn handle_recording_action(action: RecordingAction, config: &mut Config, led: &L
                 std::process::Command::new("notify-send").args(["-a", "gkeys-rs", "Recording error", &msg]),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+
+    /// A pipe stands in for either watcher's wake fd: both are pipes whose
+    /// read end becomes readable when a byte is written, which is the only
+    /// property `poll_wake` cares about.
+    fn pipe() -> (std::fs::File, std::fs::File) {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe() failed");
+        use std::os::fd::FromRawFd;
+        unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
+    }
+
+    /// The bug this whole function exists for: a profile request arriving
+    /// during the backoff has to be noticed straight away, not after up to
+    /// 30s, because the daemon answers its own clients within 5s or they are
+    /// told it timed out.
+    #[test]
+    fn a_control_request_ends_the_wait_immediately() {
+        let (rx, mut tx) = pipe();
+        tx.write_all(&[1]).unwrap();
+
+        let started = Instant::now();
+        let woke = poll_wake(None, Some(rx.as_raw_fd()), Duration::from_secs(30));
+
+        assert_eq!(woke, Wake::Control);
+        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+    }
+
+    /// The other half: the keyboard coming back must cut the backoff short,
+    /// or it stays dead for the rest of a sleep that can be 30s long.
+    #[test]
+    fn a_udev_event_ends_the_wait_immediately() {
+        let (rx, mut tx) = pipe();
+        tx.write_all(&[1]).unwrap();
+
+        let started = Instant::now();
+        let woke = poll_wake(Some(rx.as_raw_fd()), None, Duration::from_secs(30));
+
+        assert_eq!(woke, Wake::Udev);
+        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+    }
+
+    /// Both at once: udev wins, because a device that may be back is the
+    /// better reason to stop waiting. The request is not lost -- the outer
+    /// loop drains it before the next open attempt.
+    #[test]
+    fn a_udev_event_takes_precedence_over_a_control_request() {
+        let (udev_rx, mut udev_tx) = pipe();
+        let (ctl_rx, mut ctl_tx) = pipe();
+        udev_tx.write_all(&[1]).unwrap();
+        ctl_tx.write_all(&[1]).unwrap();
+
+        let woke = poll_wake(Some(udev_rx.as_raw_fd()), Some(ctl_rx.as_raw_fd()), Duration::from_secs(30));
+
+        assert_eq!(woke, Wake::Udev);
+    }
+
+    /// Nothing to report: the wait still has to end on its own, or the
+    /// backoff would never expire and the device would never be retried.
+    #[test]
+    fn an_idle_wait_ends_at_the_timeout() {
+        let (udev_rx, _udev_tx) = pipe();
+        let (ctl_rx, _ctl_tx) = pipe();
+
+        let started = Instant::now();
+        let woke = poll_wake(Some(udev_rx.as_raw_fd()), Some(ctl_rx.as_raw_fd()), Duration::from_millis(50));
+
+        assert_eq!(woke, Wake::Elapsed);
+        assert!(started.elapsed() >= Duration::from_millis(45), "returned early: {:?}", started.elapsed());
+    }
+
+    /// With neither watcher available (both failed to start) the wait must
+    /// still be a wait, not a busy spin returning instantly.
+    #[test]
+    fn with_no_watchers_at_all_it_is_still_a_timed_wait() {
+        let started = Instant::now();
+        let woke = poll_wake(None, None, Duration::from_millis(50));
+
+        assert_eq!(woke, Wake::Elapsed);
+        assert!(started.elapsed() >= Duration::from_millis(45), "returned early: {:?}", started.elapsed());
     }
 }
