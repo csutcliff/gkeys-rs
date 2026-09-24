@@ -4,6 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
+Build on neo; the daemon runs on the desktop. `scp target/release/gkeys-rs
+desktop:`, then run the deploy and service lines below via `ssh desktop`.
+
 ```bash
 cargo build --release
 
