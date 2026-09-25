@@ -37,21 +37,6 @@ The AUR package repo is at `~/claude/gkeys-rs-aur/` (separate git, `ssh://aur@au
 
 Rust 2024 edition, MSRV 1.85. Single-binary daemon using hidraw directly (not libusb - libusb detaches the kernel HID driver, breaking keyboard detection for other software).
 
-### Source Layout
-
-| File | Purpose |
-|------|---------|
-| `main.rs` | Entry point, CLI arg dispatch, device scan loop, reconnection with exponential backoff |
-| `device.rs` | hidraw device discovery (scans `/sys/class/hidraw` for vendor `046d` product `c33f` interface 1) |
-| `events.rs` | HID report parsing (20-byte reports, prefix `11 ff`, byte 2 = event type) |
-| `macros.rs` | Macro execution (run, shortcut, typeout, uinput, sequence, nothing) |
-| `proc.rs` | Fire-and-forget spawning that reaps its children (a dropped `Child` does not wait, so bare `spawn()` leaks a zombie per key press) |
-| `recording.rs` | MR key macro recording |
-| `config.rs` | JSON config loading from `~/.config/gkeys-rs/config.json` |
-| `led.rs` | M-key LED control and keyboard RGB (direct hidraw writes, command `11 ff 0b 1c <mask>`) |
-| `uinput.rs` | Virtual input device for key injection |
-| `control.rs` | Unix control socket + `--set-profile` client (see below) |
-
 ### Key Design Points
 
 - **HID report format**: 20 bytes, prefix `11 ff`, byte 2 identifies event type (`0a`=G-key, `0b`=M-key, `0c`=MR)
